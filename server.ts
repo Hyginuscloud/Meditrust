@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -10,10 +11,12 @@ import type { SiteConfig } from './src/data/siteConfig.ts';
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
+const IS_VERCEL = Boolean(process.env.VERCEL);
 const ROOT_DIR = process.cwd();
-const DATA_DIR = path.resolve(ROOT_DIR, 'data');
+const WRITABLE_DIR = IS_VERCEL ? os.tmpdir() : ROOT_DIR;
+const DATA_DIR = path.resolve(WRITABLE_DIR, IS_VERCEL ? 'meditrust-data' : 'data');
 const STORE_PATH = path.resolve(DATA_DIR, 'store.json');
-const UPLOADS_DIR = path.resolve(ROOT_DIR, 'uploads');
+const UPLOADS_DIR = path.resolve(WRITABLE_DIR, IS_VERCEL ? 'meditrust-uploads' : 'uploads');
 
 interface SessionRecord {
   token: string;
@@ -35,6 +38,56 @@ interface PersistedStore {
   auth: AuthStore;
 }
 
+function getSessionSecret(): string {
+  return (
+    process.env.SESSION_SECRET ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    'meditrust-owerri-session-secret-v1'
+  );
+}
+
+function createSignedToken(role: 'admin' | 'manager', name: string, expiresAt: number): string {
+  const payload = Buffer.from(JSON.stringify({ role, name, exp: expiresAt })).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(payload)
+    .digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifySignedToken(token: string | null): SessionRecord | null {
+  if (!token || !token.includes('.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(payload)
+    .digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+      role?: string;
+      name?: string;
+      exp?: number;
+    };
+    if (!parsed.exp || parsed.exp <= Date.now()) return null;
+    const role = parsed.role === 'manager' ? 'manager' : 'admin';
+    return {
+      token,
+      role,
+      name: parsed.name || (role === 'admin' ? 'Administrator' : 'Store Manager'),
+      expiresAt: parsed.exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -52,11 +105,15 @@ function verifyPassword(password: string, storedHash: string | null): boolean {
 }
 
 function ensureDirectories(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
+  } catch {
+    // Ignore read-only filesystem errors in serverless environments
   }
 }
 
@@ -289,15 +346,86 @@ async function uploadToSupabaseStorage(
   }
 }
 
+async function loadAuthFromSupabase(sb: SupabaseEnv, auth: AuthStore): Promise<void> {
+  try {
+    const res = await fetch(
+      `${sb.url}/rest/v1/admin_credentials?id=eq.default&select=admin_password_hash,manager_enabled,manager_name,manager_password_hash`,
+      {
+        headers: {
+          apikey: sb.serviceKey,
+          Authorization: `Bearer ${sb.serviceKey}`,
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return;
+    const rows = (await res.json()) as Array<{
+      admin_password_hash?: string;
+      manager_enabled?: boolean;
+      manager_name?: string;
+      manager_password_hash?: string | null;
+    }>;
+    const row = rows[0];
+    if (!row) return;
+    if (row.admin_password_hash && row.admin_password_hash.includes(':')) {
+      auth.adminPasswordHash = row.admin_password_hash;
+    }
+    if (typeof row.manager_enabled === 'boolean') {
+      auth.managerEnabled = row.manager_enabled;
+    }
+    if (row.manager_name) {
+      auth.managerName = row.manager_name;
+    }
+    if (row.manager_password_hash && row.manager_password_hash.includes(':')) {
+      auth.managerPasswordHash = row.manager_password_hash;
+    }
+  } catch {
+    // Fallback to local auth
+  }
+}
+
+async function syncAuthToSupabase(sb: SupabaseEnv, auth: AuthStore): Promise<void> {
+  try {
+    await fetch(`${sb.url}/rest/v1/admin_credentials?on_conflict=id`, {
+      method: 'POST',
+      headers: {
+        apikey: sb.serviceKey,
+        Authorization: `Bearer ${sb.serviceKey}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify([
+        {
+          id: 'default',
+          admin_password_hash: auth.adminPasswordHash,
+          manager_enabled: auth.managerEnabled,
+          manager_name: auth.managerName,
+          manager_password_hash: auth.managerPasswordHash,
+        },
+      ]),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    // Ignore sync errors
+  }
+}
+
 function loadStore(): PersistedStore {
   ensureDirectories();
-  if (!fs.existsSync(STORE_PATH)) {
+  const bundledStorePath = path.resolve(ROOT_DIR, 'data', 'store.json');
+  const readPath = fs.existsSync(STORE_PATH)
+    ? STORE_PATH
+    : fs.existsSync(bundledStorePath)
+    ? bundledStorePath
+    : null;
+
+  if (!readPath) {
     const initial = createInitialStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
+    saveStore(initial);
     return initial;
   }
   try {
-    const raw = fs.readFileSync(STORE_PATH, 'utf8');
+    const raw = fs.readFileSync(readPath, 'utf8');
     const parsed = JSON.parse(raw) as Partial<PersistedStore>;
     const fallback = createInitialStore();
     const mergedConfig = mergeSiteConfig(parsed.siteConfig);
@@ -316,16 +444,20 @@ function loadStore(): PersistedStore {
     };
   } catch {
     const initial = createInitialStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
+    saveStore(initial);
     return initial;
   }
 }
 
 function saveStore(store: PersistedStore): void {
   ensureDirectories();
-  const tmpPath = `${STORE_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), 'utf8');
-  fs.renameSync(tmpPath, STORE_PATH);
+  try {
+    const tmpPath = `${STORE_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), 'utf8');
+    fs.renameSync(tmpPath, STORE_PATH);
+  } catch {
+    // Ignore filesystem write errors on read-only serverless hosts
+  }
 }
 
 interface AuthedRequest extends Request {
@@ -340,20 +472,36 @@ function extractToken(req: Request): string | null {
   return null;
 }
 
-async function startServer(): Promise<void> {
+export async function createApp(): Promise<express.Express> {
   const app = express();
-  let store = loadStore();
+  const store = loadStore();
   const supabaseEnv = getSupabaseEnv();
   if (supabaseEnv) {
-    const remoteConfig = await loadSiteConfigFromSupabase(supabaseEnv);
+    const [remoteConfig] = await Promise.all([
+      loadSiteConfigFromSupabase(supabaseEnv),
+      loadAuthFromSupabase(supabaseEnv, store.auth),
+    ]);
     if (remoteConfig) {
       store.siteConfig = remoteConfig;
       saveStore(store);
     }
   }
 
+  const findActiveSession = (token: string | null): SessionRecord | null => {
+    if (!token) return null;
+    const stored = store.auth.sessions.find((s) => s.token === token && s.expiresAt > Date.now());
+    if (stored) return stored;
+    return verifySignedToken(token);
+  };
+
   // Serve uploaded images and videos
   app.use('/uploads', express.static(UPLOADS_DIR));
+  if (IS_VERCEL) {
+    const bundledUploadsDir = path.resolve(ROOT_DIR, 'uploads');
+    if (fs.existsSync(bundledUploadsDir)) {
+      app.use('/uploads', express.static(bundledUploadsDir));
+    }
+  }
 
   // Upload endpoint using raw body for fast binary images & videos
   app.post(
@@ -361,9 +509,7 @@ async function startServer(): Promise<void> {
     express.raw({ type: '*/*', limit: '100mb' }),
     async (req: AuthedRequest, res: Response) => {
       const token = extractToken(req);
-      const session = store.auth.sessions.find(
-        (s) => s.token === token && s.expiresAt > Date.now()
-      );
+      const session = findActiveSession(token);
       if (!session) {
         res.status(401).json({ error: 'Unauthorized' });
         return;
@@ -434,9 +580,7 @@ async function startServer(): Promise<void> {
 
   const requireAuth = (req: AuthedRequest, res: Response, next: NextFunction) => {
     const token = extractToken(req);
-    const session = store.auth.sessions.find(
-      (s) => s.token === token && s.expiresAt > Date.now()
-    );
+    const session = findActiveSession(token);
     if (!session) {
       res.status(401).json({ error: 'Authentication required.' });
       return;
@@ -455,12 +599,21 @@ async function startServer(): Promise<void> {
   });
 
   // Public site configuration
-  app.get('/api/site', (_req: Request, res: Response) => {
+  app.get('/api/site', async (_req: Request, res: Response) => {
+    if (IS_VERCEL && supabaseEnv) {
+      const remoteConfig = await loadSiteConfigFromSupabase(supabaseEnv);
+      if (remoteConfig) {
+        store.siteConfig = remoteConfig;
+      }
+    }
     res.json({ config: store.siteConfig });
   });
 
   // Login (supports Admin or Manager password)
-  app.post('/api/auth/login', (req: Request, res: Response) => {
+  app.post('/api/auth/login', async (req: Request, res: Response) => {
+    if (IS_VERCEL && supabaseEnv) {
+      await loadAuthFromSupabase(supabaseEnv, store.auth);
+    }
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
     if (!password) {
       res.status(400).json({ error: 'Password is required.' });
@@ -486,12 +639,13 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    const token = createSignedToken(role, name, expiresAt);
     const session: SessionRecord = {
       token,
       role,
       name,
-      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      expiresAt,
     };
 
     store.auth.sessions = [
@@ -510,7 +664,10 @@ async function startServer(): Promise<void> {
   });
 
   // Verify current session
-  app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.get('/api/auth/me', requireAuth, async (req: AuthedRequest, res: Response) => {
+    if (IS_VERCEL && supabaseEnv) {
+      await loadAuthFromSupabase(supabaseEnv, store.auth);
+    }
     res.json({
       role: req.session?.role,
       name: req.session?.name,
@@ -557,10 +714,13 @@ async function startServer(): Promise<void> {
   });
 
   // Change Admin password (Admin only)
-  app.post('/api/auth/change-password', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/change-password', requireAuth, async (req: AuthedRequest, res: Response) => {
     if (req.session?.role !== 'admin') {
       res.status(403).json({ error: 'Only Admin can change the Admin password.' });
       return;
+    }
+    if (IS_VERCEL && supabaseEnv) {
+      await loadAuthFromSupabase(supabaseEnv, store.auth);
     }
     const currentPassword =
       typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
@@ -577,14 +737,20 @@ async function startServer(): Promise<void> {
 
     store.auth.adminPasswordHash = hashPassword(newPassword);
     saveStore(store);
+    if (supabaseEnv) {
+      await syncAuthToSupabase(supabaseEnv, store.auth);
+    }
     res.json({ ok: true });
   });
 
   // Assign or update Manager password (Admin only)
-  app.post('/api/auth/manager', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/manager', requireAuth, async (req: AuthedRequest, res: Response) => {
     if (req.session?.role !== 'admin') {
       res.status(403).json({ error: 'Only Admin can assign Manager credentials.' });
       return;
+    }
+    if (IS_VERCEL && supabaseEnv) {
+      await loadAuthFromSupabase(supabaseEnv, store.auth);
     }
 
     const enabled = Boolean(req.body?.enabled);
@@ -610,11 +776,13 @@ async function startServer(): Promise<void> {
       store.auth.managerPasswordHash = hashPassword(managerPassword);
     }
     if (!enabled) {
-      // Clear active manager sessions when disabled
       store.auth.sessions = store.auth.sessions.filter((s) => s.role !== 'manager');
     }
 
     saveStore(store);
+    if (supabaseEnv) {
+      await syncAuthToSupabase(supabaseEnv, store.auth);
+    }
     res.json({
       ok: true,
       managerEnabled: store.auth.managerEnabled,
@@ -623,8 +791,17 @@ async function startServer(): Promise<void> {
     });
   });
 
+  return app;
+}
+
+async function startServer(): Promise<void> {
+  const app = await createApp();
+
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
+    const viteModule = 'vite';
+    const { createServer: createViteServer } = (await import(
+      /* @vite-ignore */ viteModule
+    )) as typeof import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -643,7 +820,9 @@ async function startServer(): Promise<void> {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!IS_VERCEL) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
